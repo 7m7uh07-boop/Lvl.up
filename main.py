@@ -100,7 +100,7 @@ DEVICE_COOLDOWN = 300    # ثواني قبل إعادة استخدام جهاز 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6KFUi4C4LJJTcJ8opjmynJWeZjrVFxm_1G1FY1Su9NQ5w")
 
 # جلب رابط السيرفر تلقائياً إن وُجد في Render/Railway أو استخدام القيمة الافتراضية
-SERVER_URL = os.getenv("SERVER_URL", "skillful-friendship-production-f9fc.up.railway.app")
+SERVER_URL = os.getenv("SERVER_URL", "https://lvlup-production.up.railway.app")
 
 
 def server_base():

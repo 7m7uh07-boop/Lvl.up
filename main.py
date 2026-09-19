@@ -1,5 +1,7 @@
 import os
 import io
+import re
+import base64
 import json
 import time
 import random
@@ -7,6 +9,7 @@ import asyncio
 import logging
 import tempfile
 from threading import Thread, Lock, Event
+from urllib.parse import quote, unquote, urlparse
 
 import sys
 import shutil
@@ -69,11 +72,12 @@ import numpy as np
 import requests
 from PIL import Image
 from flask import Flask, send_file, send_from_directory, render_template_string, abort
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -95,8 +99,17 @@ FAILOVER_THRESHOLD = 3   # إخفاقات متتالية قبل التحويل �
 DEVICE_COOLDOWN = 300    # ثواني قبل إعادة استخدام جهاز تعطل
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6KFUi4C4LJJTcJ8opjmynJWeZjrVFxm_1G1FY1Su9NQ5w")
 
-# جلب رابط السيرفر تلقائياً إن وُجد في Render أو استخدام القيمة الافتراضية
-SERVER_URL = os.getenv("SERVER_URL", "http://192.168.0.110:5000")
+# جلب رابط السيرفر تلقائياً إن وُجد في Render/Railway أو استخدام القيمة الافتراضية
+SERVER_URL = os.getenv("SERVER_URL", "skillful-friendship-production-f9fc.up.railway.app")
+
+
+def server_base():
+    """يرجع رابط السيرفر مع https:// دائماً وبدون / في النهاية."""
+    url = SERVER_URL.strip().rstrip("/")
+    if not url.startswith("http"):
+        url = "https://" + url
+    return url
+
 
 VMOS_BASE = os.getenv("VMOS_BASE", "https://api.vmoscloud.com/v1")
 AUTOCLICKER_NAME = os.getenv("AUTOCLICKER_NAME", "Auto Clicker")
@@ -210,7 +223,7 @@ def save_calibration():
         log.error("تعذر حفظ المعايرة: %s", e)
 
 
-# ==================== 3. سيرفر الويب (متوافق مع Render) ====================
+# ==================== 3. سيرفر الويب ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -263,7 +276,6 @@ def serve_apk(filename):
 
 
 def run_web_server():
-    # Render يمرر المنافذ عبر متغير البيئة PORT تلقائياً
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
@@ -953,26 +965,60 @@ def idle_screenshot_loop():
         time.sleep(IDLE_SHOT_INTERVAL)
 
 
-# ==================== 8. أوامر التلغرام ====================
+# ==================== 8. أوامر التلغرام (المحدثة) ====================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_notify_chat(update.effective_chat.id)
     await update.message.reply_text(
         "👋 بوت Free Fire على VMOS Cloud\n\n"
-        "• /setup ← Gemini يقص صور الأزرار من الشاشة الحالية ويضبط الإعدادات\n"
-        "• /autoclick ← Gemini يفعّل تطبيق الأوتو كليكر ويضع النقطة على زر البدء\n"
-        "• /installapk <رابط أو اسم ملف> ← تثبيت APK (الملفات من مجلد apks)\n"
+        "• /upload أو كلمة رفع ← أرسل APK وثبّته، ثم زر ▶️ بدء\n"
+        "• /domi <الرابط> ← تعيين رابط الدومين الخاص بـ Railway\n"
+        "• /inss ← تنزيل وتثبيت كافة ملفات APK تلقائياً\n"
+        "• /setup ← Gemini يقص صور الأزرار ويضبط الإعدادات\n"
+        "• /autoclick ← Gemini يفعّل تطبيق الأوتو كليكر\n"
+        "• /installapk <رابط أو اسم ملف> ← تثبيت APK محدد\n"
         "• UID:PASS ← بدء اللعب التلقائي\n"
         "• /level ← المستوى | /stop ← إيقاف | /stream ← البث\n"
-        "• /learn on|off ← التعلم الاحتياطي التلقائي\n"
-        "• /devices ← الأجهزة | /adddevice <معرّف> ← إضافة جهاز احتياطي\n"
-        "• /removedevice <معرّف> | /switch <معرّف> ← تحويل يدوي\n"
-        "• /snap ← لقطة شاشة | /templates ← عدد القوالب | /cleartemplates ← حذف القوالب التلقائية\n"
-        "• يمكنك أيضاً إرسال صورة زر مع كابشن: start / close / jump / continue / guest"
+        "• /devices ← الأجهزة | /adddevice <معرّف> ← إضافة جهاز\n"
+        "• /snap ← لقطة شاشة"
     )
 
 
+async def domi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global SERVER_URL
+    if not context.args:
+        await update.message.reply_text(
+            f"ℹ️ الرابط الحالي:\n{server_base()}\n\nالاستخدام: /domi https://your-domain.up.railway.app"
+        )
+        return
+    url = context.args[0].strip()
+    if not url.startswith("http"):
+        url = f"https://{url}"
+    SERVER_URL = url
+    await update.message.reply_text(f"✅ تم تحديث رابط الدومين بنجاح إلى:\n{server_base()}")
+
+
+async def inss_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not os.path.exists(APK_DIR):
+        await update.message.reply_text("❌ مجلد apks غير موجود.")
+        return
+    files = [f for f in os.listdir(APK_DIR) if f.lower().endswith(".apk")]
+    if not files:
+        await update.message.reply_text("⚠️ لا توجد أي ملفات APK داخل مجلد apks.")
+        return
+
+    await update.message.reply_text(f"📦 جاري تثبيت {len(files)} ملف(ات) APK تلقائياً...")
+    summary = []
+    for f in files:
+        apk_url = f"{server_base()}/apk/{quote(f)}"
+        res = await asyncio.to_thread(install_apk_everywhere, apk_url)
+        status = "✅ تم" if res is not None else "❌ فشل"
+        summary.append(f"• {f}: {status}")
+
+    await update.message.reply_text("📋 نتائج أمر التثبيت الشامل (/inss):\n\n" + "\n".join(summary))
+
+
 async def stream_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🌐 رابط البث المباشر:\n{SERVER_URL}")
+    await update.message.reply_text(f"🌐 رابط البث المباشر:\n{server_base()}")
 
 
 async def snap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1079,18 +1125,167 @@ async def installapk_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     arg = context.args[0]
     if arg.startswith(("http://", "https://")):
+        if "mediafire.com" in arg:
+            await install_from_link(update.message, arg)
+            return
         apk_url = arg
     else:
         name = os.path.basename(arg)
         if not os.path.exists(os.path.join(APK_DIR, name)):
             await update.message.reply_text("❌ الملف غير موجود في مجلد apks.")
             return
-        apk_url = f"{SERVER_URL}/apk/{name}"
+        apk_url = f"{server_base()}/apk/{quote(name)}"
     await update.message.reply_text("📥 جاري إرسال أمر التثبيت...")
     res = await asyncio.to_thread(install_apk_everywhere, apk_url)
     await update.message.reply_text(
         "✅ بدأ التنزيل والتثبيت." if res is not None else "❌ فشل أمر التثبيت، راجع السجل."
     )
+
+
+# ---------- تنزيل لعبة من رابط مديا فاير ----------
+DL_HEADERS = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"}
+
+
+def resolve_direct_url(url):
+    """يفتح صفحة مديا فاير ويستخرج رابط التحميل المباشر."""
+    if "mediafire.com" not in url:
+        return url
+    try:
+        html = requests.get(url, timeout=30, headers=DL_HEADERS).text
+    except Exception as e:
+        log.error("تعذر فتح رابط مديا فاير: %s", e)
+        return url
+    m = re.search(r'data-scrambled-url="([^"]+)"', html)
+    if m:
+        try:
+            return base64.b64decode(m.group(1)).decode()
+        except Exception:
+            pass
+    m = re.search(r'href="(https?://download[^"]*mediafire\.com[^"]+)"', html)
+    return m.group(1) if m else url
+
+
+def download_to_server(url):
+    """ينزّل الملف إلى مجلد apks. يرجع (اسم_الملف, None) أو (None, سبب_الفشل)."""
+    direct = resolve_direct_url(url)
+    tmp_path = None
+    try:
+        with requests.get(direct, stream=True, timeout=60, headers=DL_HEADERS) as r:
+            if r.status_code != 200:
+                return None, f"فشل التنزيل (HTTP {r.status_code})."
+            if "text/html" in r.headers.get("Content-Type", "").lower():
+                return None, "الرابط يفتح صفحة ويب وليس ملفاً. جرّب رابط زر Download المباشر."
+
+            fname = None
+            cd = r.headers.get("Content-Disposition", "")
+            m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", cd)
+            if m:
+                fname = unquote(m.group(1))
+            if not fname:
+                fname = os.path.basename(urlparse(direct).path) or "game.apk"
+            base = re.sub(r"[^A-Za-z0-9._-]", "_", fname)
+            if not base.lower().endswith(".apk"):
+                return None, f"الملف «{base}» ليس APK (XAPK أو ZIP غير مدعوم)."
+
+            name = f"{int(time.time())}_{base}"
+            tmp_path = os.path.join(APK_DIR, name + ".part")
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            os.replace(tmp_path, os.path.join(APK_DIR, name))
+            return name, None
+    except Exception as e:
+        log.error("خطأ تنزيل اللعبة: %s", e)
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        return None, "تعذر تنزيل الملف، راجع السجل."
+
+
+async def install_from_link(msg, url):
+    await msg.reply_text("🔎 جاري فتح الرابط وتنزيل اللعبة على السيرفر...")
+    name, err = await asyncio.to_thread(download_to_server, url)
+    if not name:
+        await msg.reply_text(f"❌ {err}")
+        return
+    await msg.reply_text("📲 اكتمل التنزيل. جاري التثبيت على الهاتف الافتراضي...")
+    apk_url = f"{server_base()}/apk/{quote(name)}"
+    res = await asyncio.to_thread(install_apk_everywhere, apk_url)
+    if res is None:
+        await msg.reply_text("❌ فشل أمر التثبيت، راجع السجل.")
+        return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ بدء", callback_data="upload_start")]])
+    await msg.reply_text(
+        f"✅ بدأ التثبيت.\nاللعبة: {GAME_NAME}\nاضغط «بدء» لفتح اللعبة ورفع مستوى الحساب.",
+        reply_markup=kb,
+    )
+
+
+# ---------- ميزة "رفع": أرسل APK -> تثبيت -> زر بدء ----------
+async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_notify_chat(update.effective_chat.id)
+    await update.message.reply_text(
+        "📤 أرسل لي ملف اللعبة (APK) وأثبّته على الهاتف الافتراضي.\n"
+        "• تقدر تكتب اسم اللعبة في الكابشن (اختياري).\n"
+        "• أو أرسل رابط APK مباشر."
+    )
+
+
+async def handle_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global GAME_NAME
+    msg = update.message
+    doc = msg.document
+    set_notify_chat(update.effective_chat.id)
+
+    caption = (msg.caption or "").strip()
+    if caption:
+        GAME_NAME = caption
+
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(doc.file_name or "game.apk"))
+    name = f"{int(time.time())}_{base}"
+
+    await msg.reply_text("⬇️ جاري تنزيل الملف...")
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(os.path.join(APK_DIR, name))
+    except Exception as e:
+        log.error("تعذر تنزيل الـ APK: %s", e)
+        await msg.reply_text(
+            "❌ تعذر تنزيل الملف.\n"
+            "بوتات تلغرام تنزّل حتى 20MB فقط. للملفات الأكبر أرسل رابط تحميل مباشر."
+        )
+        return
+
+    await msg.reply_text("📲 جاري التثبيت على الهاتف الافتراضي...")
+    apk_url = f"{server_base()}/apk/{quote(name)}"
+    res = await asyncio.to_thread(install_apk_everywhere, apk_url)
+    if res is None:
+        await msg.reply_text("❌ فشل أمر التثبيت، راجع السجل.")
+        return
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ بدء", callback_data="upload_start")]])
+    await msg.reply_text(
+        f"✅ بدأ التثبيت.\nاللعبة: {GAME_NAME}\nاضغط «بدء» لفتح اللعبة ورفع مستوى الحساب.",
+        reply_markup=kb,
+    )
+
+
+async def upload_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    set_notify_chat(q.message.chat_id)
+
+    if start_game():
+        # حلقة اللعب تلاحظ needs_recovery فتفتح اللعبة عبر Gemini ثم تكمل رفع اللفل
+        needs_recovery.set()
+        await q.message.reply_text(
+            f"🎮 بدأ التشغيل: فتح «{GAME_NAME}» ثم رفع المستوى تلقائياً.\nتابع بـ /level"
+        )
+    else:
+        await q.message.reply_text("ℹ️ اللعب التلقائي يعمل بالفعل.")
 
 
 async def devices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1174,11 +1369,21 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_notify_chat(update.effective_chat.id)
 
     if text.startswith(("http://", "https://")):
+        if "mediafire.com" in text:
+            await install_from_link(update.message, text)
+            return
         await update.message.reply_text("📥 جاري إرسال أمر التثبيت لكل الأجهزة...")
         res = await asyncio.to_thread(install_apk_everywhere, text)
-        await update.message.reply_text(
-            "✅ بدأ التنزيل والتثبيت." if res is not None else "❌ فشل أمر التثبيت، راجع السجل."
-        )
+        if res is None:
+            await update.message.reply_text("❌ فشل أمر التثبيت، راجع السجل.")
+        else:
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("▶️ بدء", callback_data="upload_start")]]
+            )
+            await update.message.reply_text(
+                "✅ بدأ التنزيل والتثبيت.\nاضغط «بدء» لفتح اللعبة ورفع مستوى الحساب.",
+                reply_markup=kb,
+            )
     elif ":" in text:
         uid, password = text.split(":", 1)
         if not uid.strip() or not password.strip():
@@ -1205,8 +1410,7 @@ def main():
     load_devices()
     load_calibration()
     load_templates()
-    
-    # تشغيل سيرفر الويب في خلفية مستقلة (Thread)
+
     Thread(target=run_web_server, daemon=True).start()
     Thread(target=idle_screenshot_loop, daemon=True).start()
 
@@ -1215,6 +1419,10 @@ def main():
     )
     handlers = {
         "start": start_command,
+        "upload": upload_command,
+        "raf3": upload_command,
+        "domi": domi_command,
+        "inss": inss_command,
         "stream": stream_command,
         "snap": snap_command,
         "setup": setup_command,
@@ -1233,9 +1441,12 @@ def main():
     for name, fn in handlers.items():
         bot_app.add_handler(CommandHandler(name, fn))
     bot_app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_image))
+    bot_app.add_handler(MessageHandler(filters.Document.FileExtension("apk"), handle_apk))
+    bot_app.add_handler(MessageHandler(filters.Regex(r"^\s*رفع\s*$"), upload_command))
+    bot_app.add_handler(CallbackQueryHandler(upload_start_callback, pattern="^upload_start$"))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
 
-    log.info("🚀 تم تشغيل الخادم وبوت التلغرام بنجاح على Render...")
+    log.info("🚀 تم تشغيل الخادم وبوت التلغرام بنجاح...")
     bot_app.run_polling()
 
 
